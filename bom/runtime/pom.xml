@@ -22,7 +22,7 @@
     <jetty.version>9.4.54.v20240208</jetty.version>
     <pax.logging.version>2.2.7</pax.logging.version>
     <pax.web.version>8.0.27</pax.web.version>
-    <swagger.version>2.2.15</swagger.version>
+    <swagger.version>2.2.27</swagger.version>
   </properties>
 
   <dependencyManagement>
