@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
@@ -40,6 +41,8 @@ import org.openhab.core.model.yaml.YamlElement;
 import org.openhab.core.model.yaml.YamlElementName;
 import org.openhab.core.model.yaml.YamlModelListener;
 import org.openhab.core.model.yaml.YamlModelRepository;
+import org.openhab.core.model.yaml.internal.semantics.YamlSemanticTagDTO;
+import org.openhab.core.model.yaml.internal.things.YamlThingDTO;
 import org.openhab.core.service.WatchService;
 import org.openhab.core.service.WatchService.Kind;
 import org.osgi.service.component.annotations.Activate;
@@ -83,6 +86,12 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
     private static final int DEFAULT_MODEL_VERSION = 2;
     private static final String VERSION = "version";
     private static final String READ_ONLY = "readOnly";
+    private static final Set<String> KNOWN_ELEMENTS = Set.of( //
+            getElementName(YamlSemanticTagDTO.class), // "tags"
+            getElementName(YamlThingDTO.class) // "things"
+    );
+
+    private static final String UNWANTED_EXCEPTION_TEXT = "at [Source: UNKNOWN; byte offset: #UNKNOWN] ";
 
     private final Logger logger = LoggerFactory.getLogger(YamlModelRepositoryImpl.class);
 
@@ -121,8 +130,7 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                 public FileVisitResult visitFile(@NonNullByDefault({}) Path file,
                         @NonNullByDefault({}) BasicFileAttributes attrs) throws IOException {
                     if (attrs.isRegularFile()) {
-                        Path relativePath = watchPath.relativize(file);
-                        processWatchEvent(CREATE, relativePath);
+                        processWatchEvent(CREATE, file);
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -130,7 +138,7 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                 @Override
                 public FileVisitResult visitFileFailed(@NonNullByDefault({}) Path file,
                         @NonNullByDefault({}) IOException exc) throws IOException {
-                    logger.warn("Failed to process {}: {}", file.toAbsolutePath(), exc.getClass().getSimpleName());
+                    logger.warn("Failed to process {}: {}", file.toAbsolutePath(), exc.getMessage());
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -147,10 +155,10 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
     // The method is "synchronized" to avoid concurrent files processing
     @Override
     @SuppressWarnings({ "rawtypes", "unchecked" })
-    public synchronized void processWatchEvent(Kind kind, Path path) {
-        Path fullPath = watchPath.resolve(path);
-        String modelName = path.toString();
-        if (path.startsWith("automation") || !modelName.endsWith(".yaml")) {
+    public synchronized void processWatchEvent(Kind kind, Path fullPath) {
+        Path relativePath = watchPath.relativize(fullPath);
+        String modelName = relativePath.toString();
+        if (relativePath.startsWith("automation") || !modelName.endsWith(".yaml")) {
             logger.trace("Ignored {}", fullPath);
             return;
         }
@@ -223,8 +231,7 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                     List<JsonNode> oldNodeV1Elements = model.getNodesV1().getOrDefault(elementName, List.of());
                     JsonNode oldNodeElements = model.getNodes().get(elementName);
 
-                    List<YamlModelListener<?>> elementListeners = getElementListeners(elementName, modelVersion);
-                    for (YamlModelListener<?> elementListener : elementListeners) {
+                    for (YamlModelListener<?> elementListener : getElementListeners(elementName, modelVersion)) {
                         Class<? extends YamlElement> elementClass = elementListener.getElementClass();
 
                         List<String> errors = new ArrayList<>();
@@ -274,10 +281,6 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                     } else {
                         model.getNodes().put(elementName, newNodeElements);
                     }
-
-                    if (elementListeners.isEmpty()) {
-                        logger.warn("Element '{}' in model {} is unknown.", elementName, modelName);
-                    }
                 }
 
                 // remove removed elements
@@ -302,6 +305,8 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                                 });
                             });
                 }
+
+                checkElementNames(modelName, model);
             } else {
                 logger.trace("Ignored {}", fullPath);
             }
@@ -347,21 +352,20 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
         elementListeners.computeIfAbsent(elementName, k -> new CopyOnWriteArrayList<>()).add(listener);
 
         // iterate over all models and notify the new listener of already existing models with this type
-        for (Map.Entry<String, YamlModelWrapper> model : modelCache.entrySet()) {
-            String modelName = model.getKey();
-            int modelVersion = model.getValue().getVersion();
+        modelCache.forEach((modelName, model) -> {
+            int modelVersion = model.getVersion();
             if (!listener.isVersionSupported(modelVersion)) {
-                continue;
+                return;
             }
             if (listener.isDeprecated()) {
                 logger.warn(
                         "Element {} in model {} version {} is still supported but deprecated, please consider migrating your model to a more recent version",
                         elementName, modelName, modelVersion);
             }
-            List<JsonNode> modelNodes = model.getValue().getNodesV1().getOrDefault(elementName, List.of());
-            JsonNode modelMapNode = model.getValue().getNodes().get(elementName);
+            List<JsonNode> modelNodes = model.getNodesV1().getOrDefault(elementName, List.of());
+            JsonNode modelMapNode = model.getNodes().get(elementName);
             if (modelNodes.isEmpty() && modelMapNode == null) {
-                continue;
+                return;
             }
             List<String> errors = new ArrayList<>();
             List<String> warnings = new ArrayList<>();
@@ -373,7 +377,8 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                 logger.info("YAML model {}: {}", modelName, warning);
             });
             listener.addedModel(modelName, modelElements);
-        }
+            checkElementNames(modelName, model);
+        });
     }
 
     public void removeYamlModelListener(YamlModelListener<? extends YamlElement> listener) {
@@ -384,7 +389,18 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
         });
     }
 
-    private String getElementName(Class<? extends YamlElement> elementClass) {
+    private void checkElementNames(String modelName, YamlModelWrapper model) {
+        Set<String> elementListenerNames = elementListeners.keySet();
+        if (elementListenerNames.containsAll(KNOWN_ELEMENTS)) {
+            Set<String> modelElementNames = model.getVersion() == 1 ? model.getNodesV1().keySet()
+                    : model.getNodes().keySet();
+            modelElementNames.stream().filter(e -> !KNOWN_ELEMENTS.contains(e)).forEach(unknownElement -> {
+                logger.warn("Element '{}' in model {} is unknown.", unknownElement, modelName);
+            });
+        }
+    }
+
+    private static String getElementName(Class<? extends YamlElement> elementClass) {
         YamlElementName annotation = elementClass.getAnnotation(YamlElementName.class);
         if (annotation == null) {
             throw new IllegalStateException("Class " + elementClass.getName()
@@ -694,8 +710,9 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
             return Optional.of(objectMapper.treeToValue(node, elementClass));
         } catch (JsonProcessingException e) {
             if (errors != null) {
+                String msg = e.getMessage();
                 errors.add("Could not parse element %s to %s: %s".formatted(node.toPrettyString(),
-                        elementClass.getSimpleName(), e.getMessage()));
+                        elementClass.getSimpleName(), msg == null ? "" : msg.replace(UNWANTED_EXCEPTION_TEXT, "")));
             }
             return Optional.empty();
         }
@@ -722,15 +739,16 @@ public class YamlModelRepositoryImpl implements WatchService.WatchEventListener,
                             errors.add("could not create new instance of %s".formatted(elementClass.getSimpleName()));
                         }
                     }
-
                 } else {
                     try {
                         elt = objectMapper.treeToValue(node, elementClass);
                         elt.setId(id);
                     } catch (JsonProcessingException e) {
                         if (errors != null) {
+                            String msg = e.getMessage();
                             errors.add("could not parse element %s to %s: %s".formatted(node.toPrettyString(),
-                                    elementClass.getSimpleName(), e.getMessage()));
+                                    elementClass.getSimpleName(),
+                                    msg == null ? "" : msg.replace(UNWANTED_EXCEPTION_TEXT, "")));
                         }
                     }
                 }
